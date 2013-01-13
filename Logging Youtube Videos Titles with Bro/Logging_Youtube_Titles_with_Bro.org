@@ -1,0 +1,427 @@
+#+TITLE: Logging Youtube Titles with Bro
+#+AUTHOR:  Scott Runnels
+
+* It's harder to know what and when to write than to know how to write
+  It's not uncommon for the hardest part of a Bro script to be the initial idea.  Bro is well documented, well organized and logically laid out - aspects that make Bro scripting easier to learn. Unfortunately, it's not easy to figure out just when a new script is warranted.  I love using Bro!  I love getting into discussions about it and introducing NSM practitioners to it.  I love when it dawns on people that Bro is less of an application and more of, as I recently heard Seth Hall refer to it, "a platform".  However, at times I find myself having to step back and ask myself "Wait, is this a job for Bro?"  Usually, the decision comes down not to "can Bro do this?" but to "will doing this in Bro cause a performance problem?"  As I've pointed out the in past, if you try to push Bro out of its connection-oriented safe zone and start using per-packet event handlers such as new_packet, you're going to bring your Bro workers to a stuttering stop in short order!
+
+  So, when someone asked that we include LuaJIT capabilities when we build the latest Suricata for SecurityOnion so they could write a script to log Youtube titles, I started poking around Bro and wondering if this was a "good idea".   Good idea or not, I realized it was a key learning opportunity, and like my previous posts, I'll try to walk through the life cycle of the script from testing and exploration to workable code.  
+
+* Have tracefile will travel
+  I like to start with just a tracefile, one event and Bro.  If you've followed this blog's posts about Bro, you'll notice that instead of starting with tshark, my work flow has moved to a point such that I start with Bro.  I took a moment to generate a tracefile on my laptop while I browsed through a couple of youtube clips.  Here, I have to mention a caveat:  If you capture traffic on a machine that has TCP checksum offloading (as most major OSes do) Bro will sqwak at you!
+
+  #+begin_src sh
+    bro -r youtube-browse.trace
+    WARNING: 1357934820.121088 Your trace file likely has invalid IP checksums, most likely from NIC checksum offloading. (/Users/Macphisto/Documents/src/bro/scripts/base/misc/find-checksum-offloading.bro, line 42)
+  #+end_src
+  
+  For starters take a moment and marvel that Bro includes a script that tells you when checksum offloading is in use!  Okay, enough marveling!  Back into the packet mines!  To get Bro to parse the pcap w/out complaint, give it the -C flag when you run it on the command line.  When we run the packet trace against the the default settings with Bro, we get our common and well loved .log outputs.  The for trace file I'm using, my http.log file runs approximately 175 lines.  If we want to strip out some of the chaff since we're only interested in the titles of individual videos, we can employ some bro-cut and awk to search for any URI field that starts with "/watch?v=".
+  #+begin_src sh
+    bro-cut -d ts host uri  < http.log | awk '{if ($3 ~ /^\/watch\?v=/) print $0}'  
+  #+end_src
+  #+begin_example
+    2013-01-11T15:07:03-0500    www.youtube.com /watch?v=p3Te_a-AGqM
+    2013-01-11T15:07:17-0500    www.youtube.com /watch?v=5axK-VUKJnk
+    2013-01-11T15:07:25-0500    www.youtube.com /watch?v=Zxt-c_N82_w
+    2013-01-11T15:07:29-0500    www.youtube.com /watch?v=Dgcx5blog6s
+    2013-01-11T15:07:33-0500    www.youtube.com /watch?v=zI4KfUPRU5s
+  #+end_example
+
+  So we know our pcap has the kind of traffic we want to work and we know we're looking at six videos viewed, so our logfile should include six entries.  If we were to download each page, we'd be able to pull the title of the video from the HTML title tags in the document's source.  We've got input, a desired output, and a decent guess at how to accomplish what we want.  Time to start playing with events and seeing if we can get some valid output.
+
+  At this point, I start using emacs and bro-mode's bro-event-query to search for keywords in event definitions.  You can do the same w/ grep and the events.bif.bro file or by perusing the online documentation at www.bro-ids.org/documentation if you are a member of the unwashed masses who don't adore emacs.  I try to pick keywords related to the function of the script I'm working in.  Since we are working with the HTTP protocol, the obvious query to try first is simply "http".
+  #+begin_example
+    global http_proxy_signature_found: event(c: connection);
+    global http_signature_found: event(c: connection);
+    global http_stats: event(c: connection, stats: http_stats_rec);
+    global http_event: event(c: connection, event_type: string, detail: string);
+    global http_message_done: event(c: connection, is_orig: bool, stat: http_message_stat) &group="http-body";
+    global http_content_type: event(c: connection, is_orig: bool, ty: string, subty: string) &group="http-body";
+    global http_entity_data: event(c: connection, is_orig: bool, length: count, data: string) &group="http-body";
+    global http_end_entity: event(c: connection, is_orig: bool) &group="http-body";
+    global http_begin_entity: event(c: connection, is_orig: bool) &group="http-body";
+    global http_all_headers: event(c: connection, is_orig: bool, hlist: mime_header_list) &group="http-header";
+    global http_header: event(c: connection, is_orig: bool, name: string, value: string) &group="http-header";
+    global http_reply: event(c: connection, version: string, code: count, reason: string) &group="http-reply";
+    global http_request: event(c: connection, method: string, original_URI: string, unescaped_URI: string, version: string) &group="http-request";
+    global gnutella_http_notify: event(c: connection);
+  #+end_example
+
+  Bro has a lot of great http events and we could probably spend an inordinate amount of time simply playing with each event handler, but let's jump right to the most likely suspect and look at what we can get out of [[http://bro-ids.org/documentation/scripts/base/event.bif.html?highlight=http_entity_data#id-http_entity_data][http_entity_data]].  First let's checkout it's inline documentation.  Again, here I use bro-mode, feel free to use your method of choice!
+
+  #+begin_example
+    ## Generated when parsing an HTTP body entity, passing on the data. This event
+    ## can potentially be raised many times for each entity, each time passing a
+    ## chunk of the data of not further defined size.
+    ##
+    ## A common idiom for using this event is to first *reassemble* the data
+    ## at the scripting layer by concatenating it to a successively growing
+    ## string; and only perform further content analysis once the corresponding
+    ## :bro:id:`http_end_entity` event has been raised. Note, however, that doing so
+    ## can be quite expensive for HTTP tranders. At the very least, one should
+    ## impose an upper size limit on how much data is being buffered.
+    ##
+    ## See `Wikipedia <http://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol>`__
+    ## for more information about the HTTP protocol.
+    ##
+    ## c: The connection.
+    ##
+    ## is_orig: True if the entity was sent by the originator of the TCP
+    ##          connection.
+    ##
+    ## length: The length of *data*.
+    ##
+    ## data: One chunk of raw entity data.
+    ##
+    ## .. bro:see:: http_all_headers http_begin_entity http_content_type http_end_entity
+    ##    http_event http_header http_message_done http_reply http_request http_stats
+    ##    mime_entity_data http_entity_data_delivery_size skip_http_data
+  #+end_example
+
+  Here's a point where we have to start asking ourselves if what we're doing is reasonable.  Anytime you run into a warning in the inline docs, you really do want to take them seriously!  They know their stuff, trust their advice!  Turns out we can get access to the actual HTTP stream with http_entity_data, but we need to take care that we don't start filling up data structures with the entire stream lest we overload our Bro workers.  What we need to do is find the information we want and then stop processing that stream!  
+
+  Let's play with this event handler and see if it passes muster for what we want.  The event handler below will print out the the unique identifier of the connection being processed.
+  #+begin_example
+  event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+    {
+    print c$uid;
+    }
+  
+  #+end_example
+
+ When run against the pcap I'm using, I get 15,046 lines of output.  If we pipe that output through sort | uniq -c | sort -n we get the following.
+
+ #+begin_example
+      1 Hx2s491udkc
+      1 OLADCARHdKe
+      1 qXn7aoOZIY3
+      1 vZF2AuFEO6l
+      1 yFNAPFLjO0i
+      2 2bXodAWEk0j
+      2 DanqmVQzII6
+      2 L1NSH9eF6t1
+      2 jptSnemNKpl
+      3 oqqGY7L2bv3
+      4 beBpcNoLnge
+      4 sWHlVfnoXRi
+      4 ws8K4s9Cmxg
+      5 hSl5nnrNA61
+      8 R7PLlFkOX7g
+      8 cq9sHuip6Qg
+     11 Z4Kyigf5Ltk
+     14 G46tNkORn89
+     17 KYQwK0W7dab
+     18 HOGkTeMZBqg
+     34 MELk1DePbz4
+     35 ZMKcbTWNZQ1
+     41 1Gqs5N1xCCj
+     42 8rcIgZOIrld
+     42 R5qsP8DqfXe
+    109 cWKGISIiNW4
+    119 X3MHfBQNXIk
+    338 solSn9d4peh
+    587 xQ63tbCUj92
+    942 xeMa2JrSvV8
+   1171 yGLLPuNeH1l
+   1639 7bMjnKIFyVj
+   1639 pIzbIVYHIT
+   1640 56QrlAd2szc
+   1640 M3BuzAh4Vya
+   1640 fC0dBlx8Mc3
+   3279 NxvKRXnQPf6
+ #+end_example
+
+ There's a rather large number of unique connections in this trace, some of which have just one chunk of data and other which have thousands.  Let's see if we can replicate the kind of information we got from our http.log file with bro-cut.  The major pieces of information we wanted were the host and the URI; we were, effectively, printing out the workable URL for the video.
+ 
+ #+begin_example
+ event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+    {
+    if ( /youtube.com/ in c$http$host && c$http$method == "GET" && /^\/watch\?v=/ in c$http$uri )
+        {
+        print fmt("%s%s", c$http$host, c$http$uri);
+        }
+    }
+ #+end_example
+
+ The event handler above does nothing but print the host and the uri if three conditions are met.  When constructing conditionals with multiple conditions in Bro it's best to construct them such that Bro bails out at the point that is most computationally inexpensive.  Think of it as whittling down your data in chunks such that each cut is successively more difficult to perform.  It's best to know whether the piece will fail early in the process before committing to each difficult cut.  In this example, we have a regular expression(regexp) checking if the words "youtube.com" are in the host field.  With this as our first condition, our event will bail out if the data being processed is not from Youtube, making it such that all other sites won't consume any extra memory or process cycles.  The second conditional checks that the data being processed is the result of a GET request while the third uses a regexp again to check that the URI starts with a '/' followed by "watch?v=".  Running this script against my tracefile again produces more than 14,000 lines of data, so piping through sort | uniq -c | sort -n we get the following.
+
+ #+begin_example
+   Macphisto@Lictor test-bro-youtube % bro -C -r ~/tracefiles/youtube-browse.trace /tmp/iterations_youtube.bro | sort | uniq -c | sort -n
+    104 www.youtube.com/watch?v=Zxt-c_N82_w
+    107 www.youtube.com/watch?v=zI4KfUPRU5s
+    109 www.youtube.com/watch?v=Dgcx5blog6s
+    118 www.youtube.com/watch?v=5axK-VUKJnk
+    121 www.youtube.com/watch?v=p3Te_a-AGqM
+ #+end_example
+
+ Lacking the time stamp, that is surprisingly close to the output we got from using bro-cut on http.log.  We effectively have output of the form "number of chunks of data processed" followed by the "effective youtube URL".  If you notice that there are quite a lot of chunks processed for each URL, you're right and it brings up a challenge.  We will need to keep some sort of state on these URLs.  The simplist way to do so would be to use a global variable. A globally scoped variable is accessible in any part of Bro once it is defined.  In this case, we're going to use a table.  If you are familiar with other scripting languages, a table in Bro should hold no surprises for you.  If tables are new to you, they, in short, associate a value with an index or key.
+
+ Tables in Bro are declared with the format below.
+ #+begin_example
+   SCOPE table_name: table[TYPE] of TYPE;
+ #+end_example
+
+ So, a locally scoped table of ip addresses associated with their hostnames would be declared as:
+ #+begin_example
+   local ip_to_host: table[addr] of string;
+ #+end_example
+ and populated with:
+ #+begin_example
+   local ip_to_host: table[addr] of string;
+   ip_to_host[8.8.8.8] = "google-public-dns-a.google.com";
+ #+end_example
+
+ In our script we'll use a globally scoped table indexed by the connections uid to hold the chunk or chunks of data of each connection.  To test that our idea will work how we are expecting, we'll run a test script against our tracefile.
+
+ #+begin_example
+   
+   global title_table: table[string] of string;
+   
+   event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+         {
+         if (is_orig)
+             {
+             return;
+             }
+         
+         if (/youtube.com/ in c$http$host && /^\/watch/ in c$http$uri)
+             {
+             if (! (c$uid in title_table) )
+                 {
+                 title_table[c$uid] = sub_bytes(data, 0, 15);
+                 }
+             }
+         }
+         
+   event bro_done()
+       {
+       print title_table;
+       } 
+ #+end_example
+
+ In the script above, we define our globally scoped table of strings indexed by strings.  We then use the http_entity_data event handler to process each chunk of http data.  Once the event fires, we check if this chunk was sent by the originator of the TCP connection (i.e. my browser), if so, we bail out of our function.  If it's from the server, we use the same set of regular expressions to check that the host is youtube.com and the uri is a valid video.  If both of those conditions pass, we check if there is currently an element of our table that is indexed by the unique connection ID we are currently processing.  In this case, we have to negate the value returned by "c$uid in title_table" to make our logic work.  If we have yet to see any data from this connection ID, we save the the first 15 characters of the stream to the table.  If there already exists information for that connection ID, processing of the event completes.  When Bro is finished processing, we print the contents of the title_table data structure.  As you can see, we receive the proper DOCTYPE tag of the web pages!
+
+ #+begin_example
+   {
+   [LxYAojPggeg] = <!DOCTYPE html>,
+   [Cct4cQlgsNh] = <!DOCTYPE html>,
+   [GwEa2HAfAta] = <!DOCTYPE html>
+   }
+ #+end_example
+
+ We now know our theory works in practice, so let's extend it to check for the html title tag.  We should be able to build up a big enough cache of bytes from the HTTP stream in our table to then check for the html title tag for each connection.
+
+ #+begin_example
+   # Can we log Youtube titles?
+   # We can get the first title, but HTTP is stream based and Bro sees it as such.  
+   
+   global title_table: table[string] of string;
+   
+   event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+       {
+       if (is_orig)
+           {
+           return;
+           }
+               
+       if (/youtube.com/ in c$http$host && /^\/watch/ in c$http$uri)
+           {
+           if (! (c$uid in title_table) )
+               {
+               title_table[c$uid] = data;
+               }
+           else
+               if (c$uid in title_table && byte_len(title_table[c$uid]) < 2000)
+                   {
+                   title_table[c$uid] = cat(title_table[c$uid], data);
+                   }
+               }
+           }
+   
+   
+   event bro_done()
+       {
+       local temp: table[count] of string;
+       for (i in title_table)
+           {
+           if (/\<title\>/ in title_table[i])
+               {
+               temp = split(title_table[i], /\<title\>/);
+               temp = split(temp[2], /\<\/title\>/);
+               print temp[1];
+               }
+           }
+       } 
+ #+end_example
+
+ In the script above, we do much of the same as the previous script but we're adding in some logic to make sure we don't over tax our Bro workers.  Once we check if there's already a chunk of data indexed by the current unique connection ID we also check the byte length of that data.  If the byte length of that data is less than 2000 bytes, we concatenate the current data chunk with the data already in the table.  In my entirely non-scientific study of Youtube streams, I've found the HTML title tag to be prior to 2000 bytes.  Once Bro is finished processing, we then use the bro_quit() event and process the title_table table.
+
+ When given a table, a for loop will return the indexes of the table in the temporary varaible supplied in a sequential manner.  So in this example, we are iterating over the title_table and storing each index, in turn, in the variable 'i'. Once inside the for loop, we check if there is an HTML title tag in title_table[i] and if there is, we start to use the split function.  The split function operates on a string and a  regular expression and returns a table of strings indexed by an unsigned integer.  When split finds the regular expression, it places everything before in the index of 1 and everything after it in the index of 2.  As such, we split on the opening <table> tag in title_table[i] and store the resulting table in temp, then split on the close </title> tag in the second element of temp.
+
+ Running the script against the tracefile I'm using, I get the following output.
+ #+begin_example
+   Macphisto@Lictor /tmp % bro -C -r ~/tracefiles/youtube-browse.trace ~/Documents/Writing/Blog/Logging_Youtube_With_Bro/test_youtube_v1.bro
+   Extending Emacs Rocks! Episode 01 - YouTube
+   Emacs Rocks! Live at WebRebels - YouTube
+   Extending Emacs Rocks! Episode 04 - YouTube 
+ #+end_example
+
+ Those are the titles of the videos I was browsing.  Yes, I watch videos about Emacs and so should you!  Magnars from Emacs Rocks is brilliant!  But there's a problem. If you remember the output from bro-cut there were more GET requests, five to be exact.  So what's happening here?  Well, it comes down to how the HTTP Protocol works.  An HTTP connection doesn't contain just one GET/POST/etc and a reply.  It can, in fact, contain many.  When I was browsing while generating my tracefile, I wasn't watching the entire videos (I've watched them many times!) then opening a new one, I would let it play for a while then click on one of the suggested Emacs Rocks videos.  I might have even opened a couple more in other browser tabs.  So, one of the sessions has multiple GET requests in it.  If I rerun bro-cut and include the uid, I get the following output from awk.
+
+ #+begin_example
+   Macphisto@Lictor /tmp % bro-cut -d ts uid host uri  < http.log | awk '{if ($4 ~ /^\/watch\?v=/) print $0}'
+   2013-01-11T15:07:03-0500    XuUszZPoVtl www.youtube.com /watch?v=p3Te_a-AGqM
+   2013-01-11T15:07:17-0500    cT4R1CynIka www.youtube.com /watch?v=5axK-VUKJnk
+   2013-01-11T15:07:25-0500    XuUszZPoVtl www.youtube.com /watch?v=Zxt-c_N82_w
+   2013-01-11T15:07:29-0500    XuUszZPoVtl www.youtube.com /watch?v=Dgcx5blog6s
+   2013-01-11T15:07:33-0500    rX2DqKrjQCi www.youtube.com /watch?v=zI4KfUPRU5s 
+ #+end_example
+
+ There you have it.  One connection, XuUszZPoVtl, issued three GET requests.  This presents a significant problem.  The idea was that we would only inspect the first 2000 bytes of our stream and then bail out so as to not overload our workers.  If we can't guarantee that the HTML title tag is not within the first 2000 with our current setup we're going to have to monitor the entire stream and that could add extraneous load to our Bro workers.  So, back to the drawing board.  We had a good idea, it just needs some... finesse!
+
+ Since we know that Bro detects multiple GET's we can try to use that as a toggle for our extraction of the HTML title tag.  In fact, we're even going to change the data structure we used to keep state for our script.  In testing, I'm almost certain that the HTML title tag is going to be in the first chunk of data returned after a GET request, so there's no need to store the data and keep concatenating it.  Instead we'll use a set to store the unique IDs.  A set in Bro is a list of unique entities.  The declaration of a set is similar to how we defined the table in our previous example.
+
+ In this case we'll use a set of strings, which we'll declare with:
+
+ #+begin_example
+   global title_set: set[string];
+ #+end_example
+
+ Elements of a set are managed through the use of the add and delete keywords.  In our new script, we'll keep an eye out for a GET request meeting the requirements of our youtube links and then add that unique connection ID to our set.  We'll then let http_entity_data check for the existence of that connection ID, pull our title from the first chunk of data, and then delete the entity from our globally scoped set.  This way, if there are more than GET requests in an HTTP stream, our parsing of that data will be toggled on and off at the appopriate times, freeing us from having to process any more of the HTTP stream than is necessary.
+
+ #+begin_example
+   
+   global title_set: set[string];
+   
+   event http_reply(c: connection, version: string, code: count, reason: string)
+       {
+       if ( /youtube.com/ in c$http$host && c$http$method == "GET" && /^\/watch\?v=/ in c$http$uri )
+           {
+           add title_set[c$uid];
+           }
+       }
+       
+   
+   event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+       {
+       if (is_orig)
+           {
+           return;
+           }
+   
+       if (c$uid in title_set )
+           {
+                   
+           if (/\<title\>/ in data && /\<\/title\>/ in data)
+               {
+               local temp: table[count] of string;
+               temp = split(data, /\<title\>/);
+               temp = split(temp[2], /\<\/title\>/);
+               print fmt("%s - %s %s: %s", c$http$method, c$http$host, c$http$uri, temp[1]);
+               delete title_set[c$uid];
+               }
+           }
+       }
+ #+end_example
+  
+ The new script uses the same set of splits and prints the output if it finds the opening and closing HTML title tags.  Running this script against the test packet trace produces the output we would expect.
+
+ #+begin_example
+   Macphisto@Lictor /tmp % bro -C -r ~/tracefiles/youtube-browse.trace ~/Documents/Writing/Blog/Logging_Youtube_With_Bro/test_youtube_v2.bro
+   GET - www.youtube.com /watch?v=p3Te_a-AGqM: Emacs Rocks! Live at WebRebels - YouTube
+   GET - www.youtube.com /watch?v=5axK-VUKJnk: Extending Emacs Rocks! Episode 01 - YouTube
+   GET - www.youtube.com /watch?v=Zxt-c_N82_w: Extending Emacs Rocks! Episode 02 - YouTube
+   GET - www.youtube.com /watch?v=Dgcx5blog6s: Extending Emacs Rocks! Episode 03 - YouTube
+   GET - www.youtube.com /watch?v=zI4KfUPRU5s: Extending Emacs Rocks! Episode 04 - YouTube
+ #+end_example
+
+ Output is nice, but Bro wouldn't be Bro if it weren't for logs and in its current state, this script isn't deployable.  The logs must flow and to do so, we need the logging framework and to use the logging framework there is some scaffolding we need to add to our script.  For starters, we need to give our script a namespace, such as simply "YouTube", to do this, at the top of our script we just add "module YouTube;".  We'll also need to export some information from our namespace, namely we need to add a value to the Log::ID enumerable and add a YouTube::Info record data type.  We then need to add a the YouTube::Info record to the connection record.  
+
+ #+begin_example
+   export {
+       redef enum Log::ID += { LOG };
+   
+       type Info: record {
+           ts: time &log;
+           uid: string &log;
+           id: conn_id &log;
+           host: string &log;
+           uri: string &log;
+           title: string &log;
+           };
+   }
+ 
+
+  redef record connection += {
+      youtube: Info &optional;
+      };
+ #+end_example
+
+ Adding YouTube::LOG to the Log::ID enumerable is pretty much just boilerplate code.  You'll see "redef enum Log::ID += { LOG };" in just about every single script that produces a log.  The YouTube::Info record defines information we want to log.  Any entry in this data type with the &log attribute is written to the log file when Log::write() is called.  Now, instead of printing our information to stdout, we can populate c$youtube with the appropriate information, call Log::write() and the Logging framework takes care of the rest.
+
+ Our final script is below.
+ #+begin_example
+   module YouTube;
+   
+   export {
+       redef enum Log::ID += { LOG };
+   
+       type Info: record {
+           ts: time &log;
+           uid: string &log;
+           id: conn_id &log;
+           host: string &log;
+           uri: string &log;
+           title: string &log;
+           };
+   }
+   
+   redef record connection += {
+       youtube: Info &optional;
+       };
+   
+   global title_set: set[string];
+   
+   event bro_init()
+       {
+       Log::create_stream(YouTube::LOG, [$columns=Info]);
+       }
+   
+   event http_reply(c: connection, version: string, code: count, reason: string)
+       {
+       if ( /youtube.com/ in c$http$host && c$http$method == "GET" && /^\/watch\?v=/ in c$http$uri )
+           {
+           add title_set[c$uid];
+           }
+       }
+       
+   
+   event http_entity_data(c: connection, is_orig: bool, length: count, data: string)
+       {
+       if (is_orig)
+           {
+           return;
+           }
+   
+       if (c$uid in title_set )
+           {
+           if (/\<title\>/ in data && /\<\/title\>/ in data)
+               {
+               local temp: table[count] of string;
+               temp = split(data, /\<title\>/);
+               temp = split(temp[2], /\<\/title\>/);
+               delete title_set[c$uid];
+               c$youtube = [$ts = network_time(), $uid=c$uid, $id = c$id, $host = c$http$host, $uri = c$http$uri, $title = temp[1]];
+               Log::write(YouTube::LOG, c$youtube);
+               }
+           }
+       }
+ #+end_example
+
+ Feel free to pull down the different versions of this script we've worked through from my [[https://github.com/srunnels/broselytize/tree/master/Logging%20Youtube%20Videos%20Titles%20with%20Bro][broselytize github repository]], generate a tracefile of some youtube traffic, and tinker to your hearts delight!
+
+ 
+
+ 
+
+ 
+
