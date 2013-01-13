@@ -9,10 +9,8 @@
 * Have tracefile will travel
   I like to start with just a tracefile, one event and Bro.  If you've followed this blog's posts about Bro, you'll notice that instead of starting with tshark, my work flow has moved to a point such that I start with Bro.  I took a moment to generate a tracefile on my laptop while I browsed through a couple of youtube clips.  Here, I have to mention a caveat:  If you capture traffic on a machine that has TCP checksum offloading (as most major OSes do) Bro will sqwak at you!
 
-  #+begin_src sh
-    bro -r youtube-browse.trace
-    WARNING: 1357934820.121088 Your trace file likely has invalid IP checksums, most likely from NIC checksum offloading. (/Users/Macphisto/Documents/src/bro/scripts/base/misc/find-checksum-offloading.bro, line 42)
-  #+end_src
+  : bro -r youtube-browse.trace
+  : WARNING: 1357934820.121088 Your trace file likely has invalid IP checksums, most likely from NIC checksum offloading. (/Users/Macphisto/Documents/src/bro/scripts/base/misc/find-checksum-offloading.bro, line 42)
   
   For starters take a moment and marvel that Bro includes a script that tells you when checksum offloading is in use!  Okay, enough marveling!  Back into the packet mines!  To get Bro to parse the pcap w/out complaint, give it the -C flag when you run it on the command line.  When we run the packet trace against the the default settings with Bro, we get our common and well loved .log outputs.  The for trace file I'm using, my http.log file runs approximately 175 lines.  If we want to strip out some of the chaff since we're only interested in the titles of individual videos, we can employ some bro-cut and awk to search for any URI field that starts with "/watch?v=".
 
