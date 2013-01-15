@@ -316,7 +316,7 @@
                local temp: table[count] of string;
                if ( 2 in temp )
                    {
-                   print fmt("%s - %s %s: %s", c$http$method, c$http$host, c$http$uri, temp[1]);
+                   print fmt("%s - %s %s: %s", c$http$method, c$http$host, c$http$uri, temp[2]);
                    }
                delete title_set[c$uid];
                }
