@@ -1,6 +1,7 @@
 
 global systems_seen: table[addr,port,string] of time;
 
+
 event new_connection(c: connection)
 	{
     local rfc1918_subnets: set[subnet] = set(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16);
@@ -8,12 +9,9 @@ event new_connection(c: connection)
         {
         if ( host == "<???>" )
             {
-            for ( snet in rfc1918_subnets )
+            if ( c$id$resp_h in rfc1918_subnets )
                 {
-                if ( c$id$resp_h in snet )
-                    {
-                    host = "RFC1918";
-                    }
+                host = "RFC1918";
                 }
             }
         systems_seen[c$id$resp_h, c$id$resp_p, host] = network_time(); 
