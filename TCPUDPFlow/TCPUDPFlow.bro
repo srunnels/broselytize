@@ -1,8 +1,8 @@
-# Replace tcpflow to include in sguil interface.
-
 @load base/frameworks/notice
 @load base/utils/site
 @load base/protocols/dns
+
+global notices: table[Notice::Type] of set[string];
 
 # Turn on UDP content delivery.
 redef udp_content_deliver_all_resp = T &redef;
@@ -28,13 +28,6 @@ event http_request(c: connection, method: string, original_URI: string, unescape
     print fmt("%s.%d-%s.%d: %s %s", c$id$orig_h, c$id$orig_p, c$id$resp_h, c$id$resp_p, method, original_URI);
 	}
 
- event connection_state_remove(c: connection)
- 	{
-    print c;
-     if (c?$dns)
-         print c$dns;
- 	}
-
 event udp_contents(u: connection, is_orig: bool, contents: string)
 	{
     if (is_orig)
@@ -48,4 +41,33 @@ event udp_contents(u: connection, is_orig: bool, contents: string)
     print fmt("%s",contents);
 	}
 
+event DNS::log_dns(rec: DNS::Info)
+    {
+    print("--------- DNS Log -----------");
+    if (rec?$query)
+        {
+        print(fmt("Query: %s", rec$query));
+        }
+    if (rec?$answers)
+        {
+        print(fmt("Answer(s): %s", rec$answers));
+        }
+    }
 
+event bro_done()
+    {
+    print("------ Notices Raised -------");
+    print notices;
+
+    }
+    
+event Notice::log_notice(rec: Notice::Info)
+    {
+    local curr_set: set[string];
+    if (rec$note in notices)
+        {
+        curr_set = notices[rec$note];
+        }
+    add curr_set[rec$msg];
+    notices[rec$note] = curr_set;
+    }
